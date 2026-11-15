@@ -1,0 +1,26 @@
+{
+  "name": "swarm-dashboard",
+  "version": "1.0.0",
+  "description": "Read-only live inspection dashboard for Hermes Swarm",
+  "prefix": "/api/plugins/swarm",
+  "routes": [
+    {
+      "path": "/status",
+      "method": "GET",
+      "description": "Get current active swarm status and member counts",
+      "read_only": true
+    },
+    {
+      "path": "/board",
+      "method": "GET",
+      "description": "Read paginated public message board transcript",
+      "read_only": true
+    },
+    {
+      "path": "/members",
+      "method": "GET",
+      "description": "List all swarm members, their roles, and states",
+      "read_only": true
+    }
+  ]
+}

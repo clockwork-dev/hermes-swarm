@@ -1,0 +1,12 @@
+name: swarm
+version: 1.0.0
+kind: standalone
+description: "Native Swarm & Teamwork multi-agent coordination plugin for Hermes Agent (SQLite WAL message board, @mention wakeups, Git worktree isolation, and Teamwork Coordinator mode)"
+author: cesar
+requires_hermes: ">=0.21.4"
+entrypoint: "plugins.swarm:register"
+provides_tools:
+  - swarm
+  - post_message
+  - read_board
+  - swarm_wait

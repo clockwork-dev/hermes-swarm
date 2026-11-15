@@ -1,0 +1,41 @@
+[project]
+name = "hermes-swarm"
+version = "1.0.0"
+description = "Native in-session Swarm & Teamwork multi-agent orchestration plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "cesar" },
+]
+keywords = [
+    "hermes-agent",
+    "hermes",
+    "swarm",
+    "teamwork",
+    "multi-agent",
+    "orchestration",
+    "git-worktree",
+    "sqlite-wal",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/clockwork-dev/hermes-swarm"
+Repository = "https://github.com/clockwork-dev/hermes-swarm.git"
+Issues = "https://github.com/clockwork-dev/hermes-swarm/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
