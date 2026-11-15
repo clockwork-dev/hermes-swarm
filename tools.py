@@ -11,6 +11,7 @@ Enforces role-based permission gating so workers cannot execute administrative a
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -310,8 +311,11 @@ def _spawn_live_worker_turn(
         worker_provider = member.get("provider")
         if not worker_provider or worker_provider == "custom":
             worker_provider = getattr(parent_agent, "provider", None) if parent_agent is not None else None
+        worker_effort = member.get("reasoning_effort")
+        if not worker_effort:
+            worker_effort = getattr(parent_agent, "reasoning_effort", None) if parent_agent is not None else None
 
-        if not worker_model or not worker_provider:
+        if not worker_model or not worker_provider or not worker_effort:
             try:
                 from hermes_cli.config import load_config_readonly
                 cfg = load_config_readonly() or {}
@@ -320,29 +324,45 @@ def _spawn_live_worker_turn(
                     worker_model = m_cfg.get("model") or m_cfg.get("default")
                 if not worker_provider:
                     worker_provider = m_cfg.get("provider")
+                if not worker_effort:
+                    worker_effort = m_cfg.get("reasoning_effort") or cfg.get("reasoning_effort")
             except Exception:
                 pass
+        if not worker_effort:
+            worker_effort = "low"
         child = None
         try:
-            child = agent_cls(
-                model=worker_model,
-                provider=worker_provider,
-                api_key=getattr(parent_agent, "api_key", None),
-                base_url=getattr(parent_agent, "base_url", None),
-                max_iterations=15,
-                quiet_mode=True,
-                side_agent=True,
-                skip_context_files=True,
-                skip_memory=True,
-                ephemeral_system_prompt=sys_prompt,
-                log_prefix=f"[swarm-{worker_name}]",
-                platform="subagent",
-            )
+            init_kwargs: Dict[str, Any] = {
+                "model": worker_model,
+                "provider": worker_provider,
+                "api_key": getattr(parent_agent, "api_key", None),
+                "base_url": getattr(parent_agent, "base_url", None),
+                "max_iterations": 15,
+                "quiet_mode": True,
+                "side_agent": True,
+                "skip_context_files": True,
+                "skip_memory": True,
+                "ephemeral_system_prompt": sys_prompt,
+                "log_prefix": f"[swarm-{worker_name}]",
+                "platform": "subagent",
+            }
+            try:
+                sig = inspect.signature(agent_cls)
+                accepts_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if "reasoning_effort" in sig.parameters or accepts_var_kw:
+                    init_kwargs["reasoning_effort"] = worker_effort
+                if "disabled_toolsets" in sig.parameters:
+                    init_kwargs["disabled_toolsets"] = ["skills"]
+            except Exception:
+                pass
+            child = agent_cls(**init_kwargs)
             child.swarm_member_name = worker_name
             user_prompt = (
                 f"New board message addressing you (@{worker_name}):\n{trigger_text}\n\n"
-                f"Complete your assigned task ({brief}) and either call `post_message` to report to `@coordinator` "
-                "or return a concise final summary."
+                f"Complete your assigned task ({brief}) directly using file/terminal tools without loading extra skills, "
+                "and either call `post_message` to report to `@coordinator` or return a concise final summary."
             )
             res = child.run_conversation(user_prompt)
             final_text = str((res or {}).get("final_response") or "").strip()
@@ -446,7 +466,7 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
             if not brief or not str(brief).strip():
                 raise ValueError("Worker brief is required")
 
-            _ensure_swarm_and_runtime(conn, Path(db_path), swarm_id)
+            runtime = _ensure_swarm_and_runtime(conn, Path(db_path), swarm_id)
             name = str(name).strip()
             brief = str(brief)
             model = str(kwargs.get("model") or "default")
@@ -455,6 +475,8 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
             workspace_mode = str(kwargs.get("workspace", kwargs.get("workspace_mode", "inherit")))
             tasks = kwargs.get("tasks")
             n = int(kwargs.get("n", 1) or 1)
+            is_registry_live = bool(kwargs.get("task_id") or kwargs.get("conversation_id"))
+            parent_agent = kwargs.get("parent_agent")
 
             def _resolve_ws_path(w_name: str) -> str:
                 if workspace_mode in ("share", "branch") and (Path(os.getcwd()) / ".git").exists():
@@ -464,6 +486,7 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
                         return ""
                 return ""
 
+            added_workers: List[Tuple[str, str]] = []
             if isinstance(tasks, (list, tuple)) and len(tasks) > 0:
                 for idx, task_slice in enumerate(tasks, start=1):
                     worker_name = f"{name}-{idx}"
@@ -481,9 +504,9 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
                         workspace_mode=workspace_mode,
                         workspace_path=_resolve_ws_path(worker_name),
                     )
-                return f"Worker pool '{name}' ({len(tasks)} workers) added successfully."
-
-            if n > 1:
+                    added_workers.append((worker_name, worker_brief))
+                ret_msg = f"Worker pool '{name}' ({len(tasks)} workers) added successfully."
+            elif n > 1:
                 for idx in range(1, n + 1):
                     worker_name = f"{name}-{idx}"
                     add_member(
@@ -499,22 +522,45 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
                         workspace_mode=workspace_mode,
                         workspace_path=_resolve_ws_path(worker_name),
                     )
-                return f"Worker pool '{name}' ({n} workers) added successfully."
+                    added_workers.append((worker_name, brief))
+                ret_msg = f"Worker pool '{name}' ({n} workers) added successfully."
+            else:
+                add_member(
+                    conn,
+                    swarm_id,
+                    name=name,
+                    role="worker",
+                    pool_name=kwargs.get("pool_name"),
+                    brief=brief,
+                    model=model,
+                    provider=provider,
+                    reasoning_effort=reasoning_effort,
+                    workspace_mode=workspace_mode,
+                    workspace_path=_resolve_ws_path(name),
+                )
+                added_workers.append((name, brief))
+                ret_msg = f"Worker '{name}' added successfully."
 
-            add_member(
-                conn,
-                swarm_id,
-                name=name,
-                role="worker",
-                pool_name=kwargs.get("pool_name"),
-                brief=brief,
-                model=model,
-                provider=provider,
-                reasoning_effort=reasoning_effort,
-                workspace_mode=workspace_mode,
-                workspace_path=_resolve_ws_path(name),
-            )
-            return f"Worker '{name}' added successfully."
+            if is_registry_live and added_workers:
+                for w_name, w_brief in added_workers:
+                    append_message(
+                        conn,
+                        swarm_id,
+                        "coordinator",
+                        [f"@{w_name}", w_name],
+                        f"@{w_name} {w_brief}",
+                        hop_count=0,
+                    )
+                    update_member_state(conn, swarm_id, w_name, "working")
+                    _spawn_live_worker_turn(
+                        runtime,
+                        Path(db_path),
+                        swarm_id,
+                        w_name,
+                        w_brief,
+                        parent_agent=parent_agent,
+                    )
+            return ret_msg
 
         elif action == "model":
             name = kwargs.get("name")
