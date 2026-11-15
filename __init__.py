@@ -80,7 +80,16 @@ def register(ctx: Any) -> None:
     if is_real_ctx:
         try:
             from hermes_constants import get_hermes_home
-            tools_mod.set_default_db_path(Path(get_hermes_home()) / "swarm_state.db")
+            hermes_home = Path(get_hermes_home())
+            tools_mod.set_default_db_path(hermes_home / "swarm_state.db")
+            for sname in ("swarm", "teamwork"):
+                src_md = _PLUGIN_DIR / "skills" / sname / "SKILL.md"
+                dst_md = hermes_home / "skills" / sname / "SKILL.md"
+                if src_md.is_file():
+                    dst_md.parent.mkdir(parents=True, exist_ok=True)
+                    src_text = src_md.read_text(encoding="utf-8")
+                    if not dst_md.is_file() or dst_md.read_text(encoding="utf-8", errors="ignore") != src_text:
+                        dst_md.write_text(src_text, encoding="utf-8")
         except Exception:
             pass
 
@@ -199,32 +208,41 @@ def register(ctx: Any) -> None:
             return res
 
         try:
-            ctx.register_command(
-                "swarm",
-                _plugin_swarm_cmd if is_real_ctx else handle_swarm_command,
-                description="Manage multi-agent swarm coordination",
-                args_hint="[status|board|add|say|land|kill|stop|<task>]",
-            )
-            ctx.register_command(
-                "teamwork",
-                _plugin_teamwork_cmd if is_real_ctx else handle_teamwork_command,
-                description="Initialize strict Teamwork Coordinator mode",
-                args_hint="<task>",
-            )
+            if is_real_ctx:
+                ctx.register_command(
+                    "swarm-status",
+                    _plugin_swarm_cmd,
+                    description="Inspect or manage active swarm state (status/board/kill/stop)",
+                    args_hint="[status|board|add|say|land|kill|stop]",
+                )
+            else:
+                ctx.register_command(
+                    "swarm",
+                    handle_swarm_command,
+                    description="Manage multi-agent swarm coordination",
+                    args_hint="[status|board|add|say|land|kill|stop|<task>]",
+                )
+                ctx.register_command(
+                    "teamwork",
+                    handle_teamwork_command,
+                    description="Initialize strict Teamwork Coordinator mode",
+                    args_hint="<task>",
+                )
         except Exception:
             pass
 
     if hasattr(ctx, "register_skill"):
-        skill_md = _PLUGIN_DIR / "skills" / "teamwork-coordinator" / "SKILL.md"
-        if skill_md.exists():
-            try:
-                ctx.register_skill(
-                    "teamwork-coordinator",
-                    skill_md,
-                    description="Coordinate multi-agent teamwork with disjoint file ownership and independent verification.",
-                )
-            except Exception:
-                pass
+        for sname, sdesc in (
+            ("teamwork-coordinator", "Coordinate multi-agent teamwork with disjoint file ownership and independent verification."),
+            ("swarm", "Run a multi-agent swarm (Coordinator + Workers + Independent Verifier) collaborating via a shared SQLite WAL message board."),
+            ("teamwork", "Coordinate a multi-agent Teamwork Swarm with disjoint file ownership and mandatory independent verification."),
+        ):
+            skill_md = _PLUGIN_DIR / "skills" / sname / "SKILL.md"
+            if skill_md.exists():
+                try:
+                    ctx.register_skill(sname, skill_md, description=sdesc)
+                except Exception:
+                    pass
 
     if hasattr(ctx, "register_system_prompt_section"):
         try:
