@@ -11,20 +11,24 @@ Enforces role-based permission gating so workers cannot execute administrative a
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .runtime import SwarmRuntime, parse_mentions
+from .runtime import SwarmRuntime, parse_mentions, seed_worker_context
 from .state import (
     add_member,
     append_message,
+    create_swarm,
     get_member,
     get_members,
     get_messages,
+    get_swarm,
     init_swarm_db,
     update_member_state,
     write_txn,
 )
+from .worktree_manager import create_worker_workspace
 
 _CURRENT_RUNTIME: Optional[SwarmRuntime] = None
 _CURRENT_DB_PATH: Optional[Path] = None
@@ -245,6 +249,130 @@ def _resolve_db_and_swarm(kwargs: Dict[str, Any]) -> Tuple[Optional[Path], str]:
     return db_path, swarm_id
 
 
+def _ensure_swarm_and_runtime(conn: Any, db_path: Path, swarm_id: str) -> SwarmRuntime:
+    """Ensure the swarm record exists in SQLite and a live SwarmRuntime is bound."""
+    global _CURRENT_RUNTIME, _CURRENT_DB_PATH, _CURRENT_SWARM_ID
+    if get_swarm(conn, swarm_id) is None:
+        create_swarm(conn, swarm_id, "Active Swarm", "coordinator", os.getcwd())
+    if (
+        _CURRENT_RUNTIME is None
+        or _CURRENT_DB_PATH is None
+        or Path(db_path) != _CURRENT_DB_PATH
+        or swarm_id != _CURRENT_SWARM_ID
+    ):
+        _CURRENT_RUNTIME = SwarmRuntime(swarm_id, db_path)
+        _CURRENT_DB_PATH = Path(db_path)
+        _CURRENT_SWARM_ID = str(swarm_id)
+    return _CURRENT_RUNTIME
+
+
+def _spawn_live_worker_turn(
+    runtime: SwarmRuntime,
+    db_path: Path,
+    swarm_id: str,
+    worker_name: str,
+    trigger_text: str,
+    parent_agent: Any,
+) -> None:
+    """Execute an asynchronous worker turn on SwarmRuntime's executor using a child AIAgent."""
+    if parent_agent is None or not callable(getattr(parent_agent, "run_conversation", None)):
+        return
+
+    def _worker_task() -> None:
+        conn = init_swarm_db(db_path)
+        try:
+            member = get_member(conn, swarm_id, worker_name)
+            if not member or member.get("state") == "killed":
+                return
+            board_msgs = get_messages(conn, swarm_id, since_seq=0, limit=30)
+            last_seq_before = board_msgs[-1]["seq"] if board_msgs else 0
+        finally:
+            conn.close()
+
+        brief = member.get("brief", "")
+        ws_path = member.get("workspace_path") or os.getcwd()
+        seeded = seed_worker_context(worker_name, brief, board_messages=board_msgs)
+        sys_prompt = seeded[-1]["content"] if seeded else f"You are swarm worker '{worker_name}'. Brief: {brief}"
+        if ws_path:
+            sys_prompt += f"\nWorking Directory: {ws_path}"
+
+        worker_model = member.get("model")
+        if not worker_model or worker_model == "default":
+            worker_model = getattr(parent_agent, "model", None)
+        worker_provider = member.get("provider")
+        if not worker_provider or worker_provider == "custom":
+            worker_provider = getattr(parent_agent, "provider", None)
+
+        agent_cls = type(parent_agent)
+        child = None
+        try:
+            child = agent_cls(
+                model=worker_model,
+                provider=worker_provider,
+                api_key=getattr(parent_agent, "api_key", None),
+                base_url=getattr(parent_agent, "base_url", None),
+                max_iterations=15,
+                quiet_mode=True,
+                side_agent=True,
+                skip_context_files=True,
+                skip_memory=True,
+                ephemeral_system_prompt=sys_prompt,
+                log_prefix=f"[swarm-{worker_name}]",
+                platform="subagent",
+            )
+            child.swarm_member_name = worker_name
+            user_prompt = (
+                f"New board message addressing you (@{worker_name}):\n{trigger_text}\n\n"
+                f"Complete your assigned task ({brief}) and either call `post_message` to report to `@coordinator` "
+                "or return a concise final summary."
+            )
+            res = child.run_conversation(user_prompt)
+            final_text = str((res or {}).get("final_response") or "").strip()
+
+            conn2 = init_swarm_db(db_path)
+            try:
+                recent = get_messages(conn2, swarm_id, since_seq=last_seq_before, limit=50)
+                already_posted = any(m.get("author") == worker_name for m in recent)
+                if not already_posted and final_text:
+                    reply_text = f"@coordinator {final_text}" if "@coordinator" not in final_text else final_text
+                    seq = append_message(conn2, swarm_id, worker_name, ["@coordinator"], reply_text, hop_count=1)
+                    with runtime.cond:
+                        runtime.cond.notify_all()
+                cur_mem = get_member(conn2, swarm_id, worker_name)
+                if cur_mem and cur_mem.get("state") == "working":
+                    update_member_state(conn2, swarm_id, worker_name, "waiting")
+            finally:
+                conn2.close()
+        except Exception as exc:
+            conn_err = init_swarm_db(db_path)
+            try:
+                append_message(
+                    conn_err,
+                    swarm_id,
+                    worker_name,
+                    ["@coordinator"],
+                    f"@coordinator Worker '{worker_name}' encountered an error: {exc}",
+                    hop_count=1,
+                )
+                cur_mem = get_member(conn_err, swarm_id, worker_name)
+                if cur_mem and cur_mem.get("state") == "working":
+                    update_member_state(conn_err, swarm_id, worker_name, "waiting")
+            except Exception:
+                pass
+            finally:
+                conn_err.close()
+            with runtime.cond:
+                runtime.cond.notify_all()
+        finally:
+            if child is not None and callable(getattr(child, "close", None)):
+                try:
+                    child.close()
+                except Exception:
+                    pass
+
+    runtime.start_worker(worker_name, _worker_task)
+
+
 def swarm(action: Any = "", **kwargs: Any) -> str:
     """Coordinator administrative management tool."""
     if isinstance(action, dict):
@@ -275,6 +403,7 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
             return "Active Swarm Roster:\n" + "\n".join(lines)
 
         elif action == "title":
+            _ensure_swarm_and_runtime(conn, Path(db_path), swarm_id)
             title = kwargs.get("title", "Untitled Swarm")
             if not title or not str(title).strip():
                 title = "Untitled Swarm"
@@ -299,6 +428,7 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
             if not brief or not str(brief).strip():
                 raise ValueError("Worker brief is required")
 
+            _ensure_swarm_and_runtime(conn, Path(db_path), swarm_id)
             name = str(name).strip()
             brief = str(brief)
             model = str(kwargs.get("model") or "default")
@@ -307,6 +437,14 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
             workspace_mode = str(kwargs.get("workspace", kwargs.get("workspace_mode", "inherit")))
             tasks = kwargs.get("tasks")
             n = int(kwargs.get("n", 1) or 1)
+
+            def _resolve_ws_path(w_name: str) -> str:
+                if workspace_mode in ("share", "branch") and (Path(os.getcwd()) / ".git").exists():
+                    try:
+                        return str(create_worker_workspace(os.getcwd(), swarm_id, w_name, mode=workspace_mode))
+                    except Exception:
+                        return ""
+                return ""
 
             if isinstance(tasks, (list, tuple)) and len(tasks) > 0:
                 for idx, task_slice in enumerate(tasks, start=1):
@@ -323,6 +461,7 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
                         provider=provider,
                         reasoning_effort=reasoning_effort,
                         workspace_mode=workspace_mode,
+                        workspace_path=_resolve_ws_path(worker_name),
                     )
                 return f"Worker pool '{name}' ({len(tasks)} workers) added successfully."
 
@@ -340,6 +479,7 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
                         provider=provider,
                         reasoning_effort=reasoning_effort,
                         workspace_mode=workspace_mode,
+                        workspace_path=_resolve_ws_path(worker_name),
                     )
                 return f"Worker pool '{name}' ({n} workers) added successfully."
 
@@ -354,6 +494,7 @@ def swarm(action: Any = "", **kwargs: Any) -> str:
                 provider=provider,
                 reasoning_effort=reasoning_effort,
                 workspace_mode=workspace_mode,
+                workspace_path=_resolve_ws_path(name),
             )
             return f"Worker '{name}' added successfully."
 
@@ -410,7 +551,7 @@ def post_message(text: Any = "", mentions: Optional[List[str]] = None, **kwargs:
         raise ValueError("Message text cannot be empty")
 
     ctx = _extract_context(kwargs)
-    agent = kwargs.get("agent")
+    agent = kwargs.get("agent") or kwargs.get("parent_agent")
     author = (
         kwargs.get("author")
         or ctx.get("worker_name")
@@ -425,6 +566,8 @@ def post_message(text: Any = "", mentions: Optional[List[str]] = None, **kwargs:
 
     conn = init_swarm_db(db_path)
     try:
+        if get_swarm(conn, swarm_id) is None:
+            create_swarm(conn, swarm_id, "Active Swarm", "coordinator", os.getcwd())
         members = get_members(conn, swarm_id)
         resolved_mentions = sorted(parse_mentions(text, members))
         if mentions:
@@ -437,13 +580,31 @@ def post_message(text: Any = "", mentions: Optional[List[str]] = None, **kwargs:
     finally:
         conn.close()
 
+    parent_agent = kwargs.get("parent_agent")
+    if parent_agent is not None and _CURRENT_RUNTIME is None:
+        conn_rt = init_swarm_db(db_path)
+        try:
+            _ensure_swarm_and_runtime(conn_rt, Path(db_path), swarm_id)
+        finally:
+            conn_rt.close()
+
     if (
         _CURRENT_RUNTIME is not None
         and _CURRENT_DB_PATH is not None
         and Path(db_path) == _CURRENT_DB_PATH
         and swarm_id == _CURRENT_SWARM_ID
     ):
-        _CURRENT_RUNTIME.handle_message_posted(seq, str(author), resolved_mentions, text, hop_count=hop_count)
+        res = _CURRENT_RUNTIME.handle_message_posted(seq, str(author), resolved_mentions, text, hop_count=hop_count)
+        if parent_agent is not None and not getattr(parent_agent, "swarm_member_name", None):
+            for woken_name in res.get("woken", []):
+                _spawn_live_worker_turn(
+                    _CURRENT_RUNTIME,
+                    Path(db_path),
+                    swarm_id,
+                    woken_name,
+                    str(text),
+                    parent_agent,
+                )
 
     return f"Message posted with seq {seq}"
 
