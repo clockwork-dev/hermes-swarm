@@ -168,7 +168,9 @@ def handle_swarm_command(args: Any, session_context: Optional[dict] = None, **kw
         if not text:
             return "Error: Message text cannot be empty."
         full_text = f"{target} {text}" if target.startswith("@") else f"@{target} {text}"
-        return send_board_message(full_text, author="user", db_path=db_path, swarm_id=swarm_id)
+        return send_board_message(
+            full_text, author="user", db_path=db_path, swarm_id=swarm_id, task_id="slash-say"
+        )
 
     elif subcmd == "stop":
         if not db_path:

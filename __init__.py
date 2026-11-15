@@ -119,31 +119,83 @@ def register(ctx: Any) -> None:
             pass
 
     if hasattr(ctx, "register_command"):
+        def _dispatch_coordinator_turn(coord_prompt: str, cmd_label: str, init_res: str, kw: dict[str, Any]) -> None:
+            manager = getattr(ctx, "_manager", None)
+            session_key = str(kw.get("session_key") or kw.get("session_id") or "")
+            session_id = str(kw.get("session_id") or "")
+            source = kw.get("source")
+            if manager is not None and getattr(manager, "has_tui_message_injector", False) and session_key:
+                try:
+                    if manager.inject_tui_message(
+                        session_key=session_key,
+                        content=coord_prompt,
+                        plugin_id=getattr(ctx, "plugin_id", "swarm"),
+                    ):
+                        return
+                except Exception:
+                    pass
+            if manager is not None and getattr(manager, "has_gateway_message_injector", False):
+                try:
+                    if session_id and session_key:
+                        if manager.inject_gateway_message(
+                            session_key=session_key,
+                            plugin_home=getattr(manager, "home_path", None),
+                            content=coord_prompt,
+                            plugin_id=getattr(ctx, "plugin_id", "swarm"),
+                        ):
+                            return
+                    if source is not None and callable(getattr(source, "to_dict", None)):
+                        if manager.inject_gateway_message(
+                            origin=dict(source.to_dict()),
+                            plugin_home=getattr(manager, "home_path", None),
+                            content=coord_prompt,
+                            plugin_id=getattr(ctx, "plugin_id", "swarm"),
+                        ):
+                            return
+                    if session_key:
+                        if manager.inject_gateway_message(
+                            session_key=session_key,
+                            plugin_home=getattr(manager, "home_path", None),
+                            content=coord_prompt,
+                            plugin_id=getattr(ctx, "plugin_id", "swarm"),
+                        ):
+                            return
+                except Exception:
+                    pass
+            cli_ref = getattr(manager, "_cli_ref", None)
+            if cli_ref is not None:
+                if callable(getattr(cli_ref, "_queue_prompt_turn", None)) and getattr(cli_ref, "agent", None) is not None:
+                    cli_ref._queue_prompt_turn(coord_prompt, cmd_label, str(init_res))
+                elif hasattr(cli_ref, "_pending_input"):
+                    cli_ref._pending_input.put(coord_prompt)
+
         def _plugin_swarm_cmd(raw_args: str = "", **kw: Any) -> str:
             res = handle_swarm_command(raw_args, **kw)
             tokens = str(raw_args or "").strip().split()
             if tokens and tokens[0].lower() not in {"status", "board", "add", "say", "land", "kill", "stop"}:
-                cli_ref = getattr(getattr(ctx, "_manager", None), "_cli_ref", None)
-                if cli_ref is not None and callable(getattr(cli_ref, "_queue_prompt_turn", None)):
-                    if getattr(cli_ref, "agent", None) is not None:
-                        task_str = " ".join(tokens)
-                        coord_prompt = (
-                            f"{get_coordinator_system_prompt()}\n\n"
-                            f"Active Swarm Task: {task_str}\n"
-                            "Use `swarm`, `post_message`, `read_board`, and `swarm_wait` tools to coordinate workers."
-                        )
-                        cli_ref._queue_prompt_turn(coord_prompt, "/swarm", str(res))
+                task_str = " ".join(tokens)
+                coord_prompt = (
+                    f"{get_coordinator_system_prompt()}\n\n"
+                    f"Active Swarm Task: {task_str}\n"
+                    "Use `swarm`, `post_message`, `read_board`, and `swarm_wait` tools "
+                    "(if deferred behind tool_search, invoke them via `tool_call(tool=..., arguments=...)`) "
+                    "to coordinate workers."
+                )
+                _dispatch_coordinator_turn(coord_prompt, "/swarm", str(res), kw)
             return res
 
         def _plugin_teamwork_cmd(raw_args: str = "", **kw: Any) -> str:
             res = handle_teamwork_command(raw_args, **kw)
             task_str = str(raw_args or "").strip()
             if task_str and not str(res).startswith("Warning:") and not str(res).startswith("Usage:"):
-                cli_ref = getattr(getattr(ctx, "_manager", None), "_cli_ref", None)
-                if cli_ref is not None and callable(getattr(cli_ref, "_queue_prompt_turn", None)):
-                    if getattr(cli_ref, "agent", None) is not None:
-                        coord_prompt = f"{get_coordinator_system_prompt()}\n\nTeamwork Task: {task_str}"
-                        cli_ref._queue_prompt_turn(coord_prompt, "/teamwork", str(res))
+                coord_prompt = (
+                    f"{get_coordinator_system_prompt()}\n\n"
+                    f"Teamwork Task: {task_str}\n"
+                    "Use `swarm`, `post_message`, `read_board`, and `swarm_wait` tools "
+                    "(if deferred behind tool_search, invoke them via `tool_call(tool=..., arguments=...)`) "
+                    "to coordinate workers."
+                )
+                _dispatch_coordinator_turn(coord_prompt, "/teamwork", str(res), kw)
             return res
 
         try:

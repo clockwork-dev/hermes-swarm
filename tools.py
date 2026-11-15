@@ -12,6 +12,7 @@ Enforces role-based permission gating so workers cannot execute administrative a
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -194,10 +195,12 @@ def set_default_db_path(db_path: Path | str | None) -> None:
 
 def set_active_swarm(swarm_id: str, db_path: Path | str | None = None) -> None:
     """Update the active swarm_id and optionally the default SQLite database path."""
-    global _CURRENT_SWARM_ID, _CURRENT_DB_PATH
+    global _CURRENT_SWARM_ID, _CURRENT_DB_PATH, _CURRENT_RUNTIME
     _CURRENT_SWARM_ID = str(swarm_id)
-    if _CURRENT_DB_PATH is None and db_path is not None:
+    if db_path is not None:
         _CURRENT_DB_PATH = Path(db_path)
+    if _CURRENT_DB_PATH is not None:
+        _CURRENT_RUNTIME = SwarmRuntime(_CURRENT_SWARM_ID, _CURRENT_DB_PATH)
 
 
 def bind_tool_runtime(
@@ -272,10 +275,15 @@ def _spawn_live_worker_turn(
     swarm_id: str,
     worker_name: str,
     trigger_text: str,
-    parent_agent: Any,
+    parent_agent: Any = None,
 ) -> None:
     """Execute an asynchronous worker turn on SwarmRuntime's executor using a child AIAgent."""
-    if parent_agent is None or not callable(getattr(parent_agent, "run_conversation", None)):
+    if parent_agent is not None and callable(getattr(parent_agent, "run_conversation", None)):
+        agent_cls = type(parent_agent)
+    else:
+        run_agent_mod = sys.modules.get("run_agent")
+        agent_cls = getattr(run_agent_mod, "AIAgent", None) if run_agent_mod is not None else None
+    if agent_cls is None:
         return
 
     def _worker_task() -> None:
@@ -298,12 +306,22 @@ def _spawn_live_worker_turn(
 
         worker_model = member.get("model")
         if not worker_model or worker_model == "default":
-            worker_model = getattr(parent_agent, "model", None)
+            worker_model = getattr(parent_agent, "model", None) if parent_agent is not None else None
         worker_provider = member.get("provider")
         if not worker_provider or worker_provider == "custom":
-            worker_provider = getattr(parent_agent, "provider", None)
+            worker_provider = getattr(parent_agent, "provider", None) if parent_agent is not None else None
 
-        agent_cls = type(parent_agent)
+        if not worker_model or not worker_provider:
+            try:
+                from hermes_cli.config import load_config_readonly
+                cfg = load_config_readonly() or {}
+                m_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+                if not worker_model:
+                    worker_model = m_cfg.get("model") or m_cfg.get("default")
+                if not worker_provider:
+                    worker_provider = m_cfg.get("provider")
+            except Exception:
+                pass
         child = None
         try:
             child = agent_cls(
@@ -581,7 +599,8 @@ def post_message(text: Any = "", mentions: Optional[List[str]] = None, **kwargs:
         conn.close()
 
     parent_agent = kwargs.get("parent_agent")
-    if parent_agent is not None and _CURRENT_RUNTIME is None:
+    is_live_dispatch = parent_agent is not None or bool(kwargs.get("task_id") or kwargs.get("conversation_id"))
+    if is_live_dispatch and _CURRENT_RUNTIME is None:
         conn_rt = init_swarm_db(db_path)
         try:
             _ensure_swarm_and_runtime(conn_rt, Path(db_path), swarm_id)
@@ -595,7 +614,12 @@ def post_message(text: Any = "", mentions: Optional[List[str]] = None, **kwargs:
         and swarm_id == _CURRENT_SWARM_ID
     ):
         res = _CURRENT_RUNTIME.handle_message_posted(seq, str(author), resolved_mentions, text, hop_count=hop_count)
-        if parent_agent is not None and not getattr(parent_agent, "swarm_member_name", None):
+        is_worker_caller = bool(getattr(parent_agent, "swarm_member_name", None)) or str(author) not in (
+            "user",
+            "coordinator",
+            "swarm_coordinator",
+        )
+        if is_live_dispatch and not is_worker_caller:
             for woken_name in res.get("woken", []):
                 _spawn_live_worker_turn(
                     _CURRENT_RUNTIME,

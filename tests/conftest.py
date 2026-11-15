@@ -108,26 +108,26 @@ from hermes_cli.commands import COMMAND_REGISTRY, CommandDef
 # Ensure COMMAND_REGISTRY contains swarm & teamwork even on unpatched Hermes cores
 _existing_cmd_names = {c.name for c in COMMAND_REGISTRY}
 if "swarm" not in _existing_cmd_names:
-    COMMAND_REGISTRY.append(
-        CommandDef(
-            "swarm",
-            "Manage in-session multi-agent swarm (board, status, workers, worktrees)",
-            "session",
-            args_hint="[<task>|status|board|add|say|land|kill|stop]",
-            surfaces=frozenset({"cli", "gateway", "tui"}),
-            busy_policy="dispatch",
-        )
+    _swarm_def = CommandDef(
+        "swarm",
+        "Manage in-session multi-agent swarm (board, status, workers, worktrees)",
+        "Session",
+        args_hint="[<task>|status|board|add|say|land|kill|stop]",
+        subcommands=("status", "board", "add", "say", "land", "kill", "stop"),
+        busy_policy="dispatch",
     )
+    object.__setattr__(_swarm_def, "surfaces", frozenset({"cli", "gateway", "tui"}))
+    COMMAND_REGISTRY.append(_swarm_def)
 if "teamwork" not in _existing_cmd_names:
-    COMMAND_REGISTRY.append(
-        CommandDef(
-            "teamwork",
-            "Start autonomous Teamwork Swarm Coordinator mode for a task",
-            "session",
-            args_hint="<task>",
-            surfaces=frozenset({"cli", "gateway", "tui"}),
-        )
+    _tw_def = CommandDef(
+        "teamwork",
+        "Start autonomous Teamwork Swarm Coordinator mode for a task",
+        "Session",
+        args_hint="<task>",
+        busy_policy="dispatch",
     )
+    object.__setattr__(_tw_def, "surfaces", frozenset({"cli", "gateway", "tui"}))
+    COMMAND_REGISTRY.append(_tw_def)
 
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall, write_hermes_home
 
